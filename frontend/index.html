@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Farming Digital Twin & Crop Pathology Suite</title>
+    
+    <!-- Three.js & OrbitControls for 3D Digital Twin -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    
+    <!-- Chart.js for Telemetry Trends -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    
+    <!-- Stylesheet -->
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+    <!-- Top Navigation & IoT Connection Bar -->
+    <header class="navbar">
+        <div class="brand">
+            <div class="brand-icon">🌱</div>
+            <div>
+                <h1>AgriTwin Pro</h1>
+                <p>Smart Farming Digital Twin & AI Crop Health Inspector</p>
+            </div>
+        </div>
+
+        <div class="nav-controls">
+            <!-- Hardware / Port Picker -->
+            <div class="port-group">
+                <select id="portSelect" class="custom-select" title="Select Microcontroller Port">
+                    <option value="">Scanning COM ports...</option>
+                </select>
+                <button id="btnConnect" class="btn btn-primary" title="Connect to ESP8266/Arduino">Connect</button>
+                <button id="btnDisconnect" class="btn btn-secondary" title="Disconnect">Disconnect</button>
+                <button id="btnSimulate" class="btn btn-secondary" title="Activate realistic sensor simulation">Simulation</button>
+                <button id="btnRefreshPorts" class="btn btn-secondary" title="Rescan Ports">↻</button>
+            </div>
+
+            <!-- Status Indicator Badge -->
+            <div id="connectionStatusBadge" class="status-badge badge-sim">
+                <span class="badge-dot dot-sim"></span> Source: <strong>Simulation Mode</strong>
+            </div>
+
+            <!-- Audio Alert Checkbox -->
+            <label style="display:flex; align-items:center; gap:6px; font-size:12px; color:var(--text-muted); cursor:pointer;">
+                <input type="checkbox" id="chkAudioAlert" /> Audio Alarms
+            </label>
+        </div>
+    </header>
+
+    <!-- Main Dashboard Container -->
+    <main class="dashboard-container">
+
+        <!-- ROW 1: 3D Digital Twin & Live Sensor Telemetry -->
+        <section class="grid-row-twin-telemetry">
+            
+            <!-- 3D Digital Twin Viewport -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <span class="card-title-icon">🪴</span>
+                        <span>Plant Digital Twin (Camera-Tracked Estimate)</span>
+                    </div>
+                    <div style="display:flex; gap:8px;">
+                        <button id="btnResetPlantScan" class="btn btn-secondary" style="font-size:11px; padding:4px 10px;" title="Clear the current plant reference scan">
+                            New Plant Baseline
+                        </button>
+                        <button id="btnToggleWireframe" class="btn btn-secondary" style="font-size:11px; padding:4px 10px;">
+                            Biometric Wireframe
+                        </button>
+                    </div>
+                </div>
+                <div class="card-body" style="padding: 12px;">
+                    <div class="twin-viewport-container">
+                        <div id="digitalTwinCanvas"></div>
+                        
+                        <!-- Real-Time HUD Overlay -->
+                        <div class="twin-hud-overlay">
+                            <div class="twin-hud-chip">
+                                🌿 Turgor Status: <strong id="hudTurgor">Hydrated & Erect</strong>
+                            </div>
+                            <div class="twin-hud-chip">
+                                💡 Grow Luminaire: <strong id="hudGrowLamp">Sync with LDR</strong>
+                            </div>
+                            <div class="twin-hud-chip">
+                                🔍 Pathological Coloration: <strong id="hudPathology">Lush (Healthy)</strong>
+                            </div>
+                            <div class="twin-hud-chip">
+                                📷 Plant Scan: <strong id="hudPlantScan">Waiting for first camera scan</strong>
+                            </div>
+                        </div>
+
+                        <!-- Orbit Controls Hint -->
+                        <div class="twin-controls-bar">
+                            <span style="font-size:11px; color:#64748b; background:rgba(0,0,0,0.6); padding:4px 8px; border-radius:4px;">
+                                🖱️ Drag to rotate 360° | Scroll to zoom
+                            </span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Live IoT Sensor Telemetry -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <span class="card-title-icon">📊</span>
+                        <span>Microcontroller Telemetry (DHT11 & LDR)</span>
+                    </div>
+                    <span style="font-size:12px; color:var(--text-dim);" id="telemetryBaud">115200 Baud</span>
+                </div>
+                <div class="card-body">
+                    <div class="telemetry-grid">
+                        
+                        <!-- Temperature Card -->
+                        <div class="telemetry-card">
+                            <div class="telemetry-card-top">
+                                <span class="telemetry-label">Temperature (DHT11)</span>
+                                <span class="telemetry-icon">🌡️</span>
+                            </div>
+                            <div class="telemetry-value-wrap">
+                                <span class="telemetry-value" id="metricTemp">24.5</span>
+                                <span class="telemetry-unit">°C</span>
+                            </div>
+                            <div id="tempStatus" class="metric-status status-good">
+                                Optimal Range (20-28°C)
+                            </div>
+                        </div>
+
+                        <!-- Humidity Card -->
+                        <div class="telemetry-card">
+                            <div class="telemetry-card-top">
+                                <span class="telemetry-label">Humidity (DHT11)</span>
+                                <span class="telemetry-icon">💧</span>
+                            </div>
+                            <div class="telemetry-value-wrap">
+                                <span class="telemetry-value" id="metricHum">62.0</span>
+                                <span class="telemetry-unit">%</span>
+                            </div>
+                            <div id="humStatus" class="metric-status status-good">
+                                Optimal Range (55-75%)
+                            </div>
+                        </div>
+
+                        <!-- Light Intensity Card (LDR) -->
+                        <div class="telemetry-card">
+                            <div class="telemetry-card-top">
+                                <span class="telemetry-label">Light Level (LDR A0)</span>
+                                <span class="telemetry-icon">☀️</span>
+                            </div>
+                            <div class="telemetry-value-wrap">
+                                <span class="telemetry-value" id="metricLight">680</span>
+                                <span class="telemetry-unit">/ 1023</span>
+                            </div>
+                            <div id="lightStatus" class="metric-status status-warn">
+                                Dim / Below Threshold (&lt; 700)
+                            </div>
+                        </div>
+
+                        <!-- LED Grow Light Card -->
+                        <div class="telemetry-card">
+                            <div class="telemetry-card-top">
+                                <span class="telemetry-label">Grow LED (Pin D5)</span>
+                                <span class="telemetry-icon">💡</span>
+                            </div>
+                            <div class="telemetry-value-wrap">
+                                <div id="metricLed" class="led-card-state state-on">
+                                    <span class="led-indicator led-on"></span> ACTIVE (ON)
+                                </div>
+                            </div>
+                            <div style="font-size:11px; color:var(--text-dim);">
+                                Threshold: &lt; 700 turns ON
+                            </div>
+                        </div>
+
+                    </div>
+
+                    <!-- Microcontroller Serial Stream Message -->
+                    <div class="system-status-banner">
+                        <span>📡</span>
+                        <span id="systemStatusText">Receiving 2000ms sensor cycles from microcontroller</span>
+                    </div>
+                </div>
+            </div>
+
+        </section>
+
+        <!-- ROW 2: Laptop Webcam Plant Scanner & Automated Crop Pathology Report -->
+        <section class="grid-row-vision-report">
+            
+            <!-- Left: Laptop Camera Scanner -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <span class="card-title-icon">📷</span>
+                        <span>Plant Vision Scanner (Laptop Camera)</span>
+                    </div>
+                    <label style="display:flex; align-items:center; gap:6px; font-size:12px; color:var(--text-muted); cursor:pointer;">
+                        <input type="checkbox" id="toggleAutoScan" /> Auto-Scan (25s)
+                    </label>
+                </div>
+                <div class="card-body">
+                    <div class="camera-view-container">
+                        <video id="webcamVideo" autoplay playsinline></video>
+                        <div id="cameraPlaceholder" class="camera-placeholder">
+                            <span class="camera-placeholder-icon">📸</span>
+                            <p style="font-size:13px;">Camera Inactive</p>
+                            <span style="font-size:11px;">Frame the whole plant and keep camera position fixed between scans</span>
+                        </div>
+                        
+                        <!-- Scanning Progress Overlay -->
+                        <div id="scanLoader" class="scan-loader-overlay">
+                            <div class="spinner"></div>
+                            <p style="font-size:13px; font-weight:600; color:#fff;">Scanning Plant Structure & Health...</p>
+                            <span style="font-size:11px; color:var(--primary-green);">Measuring visible canopy and segmenting leaf symptoms</span>
+                        </div>
+                    </div>
+
+                    <!-- Scanner Buttons -->
+                    <div class="scanner-actions">
+                        <button id="btnStartCam" class="btn btn-primary">Start Camera</button>
+                        <button id="btnStopCam" class="btn btn-secondary" style="display:none;">Stop Camera</button>
+                        <button id="btnCaptureScan" class="btn btn-accent">Capture & Diagnose</button>
+                        
+                        <label class="btn btn-secondary" style="cursor:pointer;" title="Upload an existing photo of leaf">
+                            📁 Upload Photo
+                            <input type="file" id="imageFileInput" accept="image/*" style="display:none;" />
+                        </label>
+                    </div>
+
+                    <!-- Sample Leaves Tray for Instant Testing -->
+                    <div class="samples-tray">
+                        <span class="samples-tray-label">⚡ Test with Sample Crop Conditions:</span>
+                        <div class="samples-container" id="samplesContainer">
+                            <!-- Populated dynamically with sample chips -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right: Farmer Pathology Diagnostic Report -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <span class="card-title-icon">🩺</span>
+                        <span>Crop Pathology & Diagnostic Report</span>
+                    </div>
+                    <button id="btnPrintReport" class="btn btn-secondary" style="font-size:11px; padding:4px 10px;">
+                        🖨️ Print / Save PDF
+                    </button>
+                </div>
+                <div class="card-body">
+                    
+                    <!-- Side-by-Side Images: Original vs Lesion Heatmap -->
+                    <div class="report-images-compare">
+                        <div class="image-compare-box">
+                            <label>Foliage Snapshot</label>
+                            <img id="diagImgOriginal" class="compare-img" src="samples/sample_healthy.jpg" alt="Captured Foliage" />
+                        </div>
+                        <div class="image-compare-box">
+                            <label>Diagnostic Lesion Heatmap</label>
+                            <img id="diagImgAnnotated" class="compare-img" src="samples/sample_healthy.jpg" alt="Annotated Lesion Analysis" />
+                        </div>
+                    </div>
+
+                    <!-- Diagnosis Title & Severity Health Score -->
+                    <div class="diagnosis-hero-banner">
+                        <div class="diagnosis-main-title">
+                            <h3 id="diagName">Healthy Plant (Optimal Vigour)</h3>
+                            <span id="diagPathogen" class="pathogen-pill">None (Optimal Health)</span>
+                        </div>
+                        <div class="severity-health-group">
+                            <div id="diagSeverity" class="severity-badge severity-healthy">
+                                HEALTHY
+                            </div>
+                            <div class="health-gauge-box">
+                                <span>HEALTH SCORE</span>
+                                <div id="diagHealthScore" class="health-gauge-score">98/100</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Quantitative Surface Damage Metrics -->
+                    <div class="metrics-strip">
+                        <div class="metric-strip-item">
+                            <label>Total Damage</label>
+                            <strong id="metricDamagePct">0.0%</strong>
+                        </div>
+                        <div class="metric-strip-item">
+                            <label>Necrosis / Brown</label>
+                            <strong id="metricNecroticPct">0.0%</strong>
+                        </div>
+                        <div class="metric-strip-item">
+                            <label>Chlorosis / Yellow</label>
+                            <strong id="metricChlorosisPct">0.0%</strong>
+                        </div>
+                        <div class="metric-strip-item">
+                            <label>Powdery Mildew</label>
+                            <strong id="metricMildewPct">0.0%</strong>
+                        </div>
+                    </div>
+
+                    <!-- Clinical Symptoms -->
+                    <div class="section-block">
+                        <div class="section-block-title">
+                            <span>🔍</span> Symptom Identification:
+                        </div>
+                        <p id="diagSymptoms">
+                            No significant pathogens or necrotic lesions detected. Photosynthetic foliage is lush and active.
+                        </p>
+                    </div>
+
+                    <!-- IoT Sensor Correlation Warning (Environmental Trigger) -->
+                    <div id="sensorWarningsBox" class="sensor-warning-alert">
+                        <ul id="sensorWarningsList">
+                            <!-- Dynamic sensor correlation warnings -->
+                        </ul>
+                    </div>
+
+                    <!-- Farmer Action & Treatment Protocol -->
+                    <div class="section-block">
+                        <div class="section-block-title">
+                            <span>🌾</span> Farmer Action Protocol & Remediation:
+                        </div>
+                        <div class="treatment-grid">
+                            <div class="treatment-box">
+                                <h5>1. Immediate Containment</h5>
+                                <p id="planImmediate">Maintain current watering, light exposure, and nutrient schedule.</p>
+                            </div>
+                            <div class="treatment-box">
+                                <h5>2. Organic Treatment</h5>
+                                <p id="planOrganic">Preventative application of seaweed extract or mild compost tea every 14 days.</p>
+                            </div>
+                            <div class="treatment-box">
+                                <h5>3. Commercial Solution</h5>
+                                <p id="planChemical">None required.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Optional Gemini AI Consultation Box -->
+                    <div id="geminiBox" class="gemini-box">
+                        <h5>🤖 AI Agronomist Deep Consultation</h5>
+                        <p id="geminiText"></p>
+                    </div>
+
+                    <div style="margin-top:12px; font-size:11px; color:var(--text-dim); text-align:right;" id="diagTimestamp">
+                        Report generated: Ready
+                    </div>
+
+                </div>
+            </div>
+
+        </section>
+
+        <!-- ROW 3: Telemetry Analytics Charts & Environmental Sandbox -->
+        <section class="grid-row-analytics">
+            
+            <!-- Real-Time Telemetry Trends -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <span class="card-title-icon">📈</span>
+                        <span>Microclimate Telemetry Analytics (Last 60 readings)</span>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div class="chart-container">
+                        <canvas id="tempHumChart"></canvas>
+                    </div>
+                    <div class="chart-container" style="height:150px; margin-bottom:0;">
+                        <canvas id="lightChart"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Environmental Sandbox (Manual Testing) -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <span class="card-title-icon">🎛️</span>
+                        <span>Telemetry Sandbox (Test Plant Reaction)</span>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <p style="font-size:12px; color:var(--text-muted); line-height:1.4; margin-bottom:14px;">
+                        Adjust parameters to test how the 3D Digital Twin and crop diagnostics respond to extreme farm microclimates:
+                    </p>
+
+                    <div class="sandbox-slider-group">
+                        <div class="slider-row">
+                            <div class="slider-header">
+                                <span>Temperature</span>
+                                <strong id="valTemp">25.0°C</strong>
+                            </div>
+                            <input type="range" id="sliderTemp" min="10" max="45" step="0.5" value="25" />
+                        </div>
+
+                        <div class="slider-row">
+                            <div class="slider-header">
+                                <span>Humidity</span>
+                                <strong id="valHum">60.0%</strong>
+                            </div>
+                            <input type="range" id="sliderHum" min="20" max="95" step="1" value="60" />
+                        </div>
+
+                        <div class="slider-row">
+                            <div class="slider-header">
+                                <span>Light Intensity (LDR)</span>
+                                <strong id="valLight">680</strong>
+                            </div>
+                            <input type="range" id="sliderLight" min="50" max="1023" step="10" value="680" />
+                        </div>
+                    </div>
+
+                    <div style="margin-top:20px; font-size:11px; color:var(--text-dim); line-height:1.4;">
+                        💡 Tip: Sliding Light below 700 turns ON the 3D grow luminaire and activates the Arduino LED (Pin D5).
+                        Lowering Humidity below 40% triggers leaf wilting in the Digital Twin.
+                    </div>
+                </div>
+            </div>
+
+        </section>
+
+    </main>
+
+    <!-- App Scripts -->
+    <script src="js/digital_twin.js"></script>
+    <script src="js/charts.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
