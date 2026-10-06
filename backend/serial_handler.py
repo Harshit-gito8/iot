@@ -5,6 +5,10 @@ import math
 import random
 import serial
 import serial.tools.list_ports
+from typing import Optional, Dict, Any, List
+
+from backend import database as db
+from backend.plant_engine import plant_engine
 
 class SerialHandler:
     def __init__(self):
@@ -12,10 +16,11 @@ class SerialHandler:
         self.baudrate = 115200
         self.ser = None
         self.is_connected = False
-        self.simulation_mode = True  # Defaults to simulation if no physical device is connected
+        self.simulation_mode = True
         self.thread = None
         self.running = False
         self.lock = threading.Lock()
+        self.on_telemetry_callbacks = []
 
         # Telemetry state
         self.latest_data = {
@@ -24,17 +29,24 @@ class SerialHandler:
             "light_value": 680,
             "led_state": True,
             "threshold": 700,
+            "vpd": 1.05,
+            "turgor_wilt": 0.0,
             "status_message": "Simulation Active",
             "last_updated": time.time(),
             "port": "SIMULATED",
-            "is_simulation": True
+            "is_simulation": True,
+            "source": "simulation"
         }
 
-        # Rolling history for frontend analytics charts (up to 60 readings)
+        # Rolling history for quick memory lookups
         self.history = []
 
         # Start background worker
         self.start()
+
+    def register_callback(self, cb):
+        if cb not in self.on_telemetry_callbacks:
+            self.on_telemetry_callbacks.append(cb)
 
     def get_available_ports(self):
         ports = []
@@ -46,7 +58,7 @@ class SerialHandler:
             })
         return ports
 
-    def connect(self, port_name, baudrate=115200):
+    def connect(self, port_name: str, baudrate: int = 115200):
         with self.lock:
             self.disconnect()
             try:
@@ -57,6 +69,7 @@ class SerialHandler:
                 self.simulation_mode = False
                 self.latest_data["port"] = port_name
                 self.latest_data["is_simulation"] = False
+                self.latest_data["source"] = "serial"
                 self.latest_data["status_message"] = f"Connected to {port_name} at {baudrate} baud"
                 return True, f"Successfully connected to {port_name}"
             except Exception as e:
@@ -65,6 +78,7 @@ class SerialHandler:
                 self.simulation_mode = True
                 self.latest_data["port"] = "SIMULATED"
                 self.latest_data["is_simulation"] = True
+                self.latest_data["source"] = "simulation"
                 self.latest_data["status_message"] = f"Connection error: {str(e)}. Reverting to simulation."
                 return False, str(e)
 
@@ -84,7 +98,30 @@ class SerialHandler:
             self.simulation_mode = True
             self.latest_data["port"] = "SIMULATED"
             self.latest_data["is_simulation"] = True
+            self.latest_data["source"] = "simulation"
             self.latest_data["status_message"] = "Simulation Active"
+
+    def write_command(self, command: str) -> bool:
+        """Bidirectional actuation: sends command to physical hardware over serial"""
+        with self.lock:
+            if self.is_connected and self.ser and self.ser.is_open:
+                try:
+                    if not command.endswith("\n"):
+                        command += "\n"
+                    self.ser.write(command.encode("utf-8"))
+                    return True
+                except Exception as e:
+                    print(f"Error writing to serial: {e}")
+                    return False
+            return False
+
+    def set_actuator_led(self, state: bool) -> bool:
+        """Actuate grow LED physically or virtually"""
+        with self.lock:
+            self.latest_data["led_state"] = state
+        cmd = "CMD:LED_ON" if state else "CMD:LED_OFF"
+        sent = self.write_command(cmd)
+        return sent or self.simulation_mode
 
     def start(self):
         if not self.running:
@@ -99,7 +136,6 @@ class SerialHandler:
         self.disconnect()
 
     def _worker_loop(self):
-        # Auto-try to discover hardware if possible
         sim_step = 0
         while self.running:
             if self.is_connected and self.ser and self.ser.is_open:
@@ -113,16 +149,16 @@ class SerialHandler:
                         self.disconnect()
                         self.simulation_mode = True
                         self.latest_data["is_simulation"] = True
+                        self.latest_data["source"] = "simulation"
                         self.latest_data["port"] = "SIMULATED"
                 time.sleep(0.05)
             else:
-                # Simulation Mode: realistic dynamic agricultural telemetry
+                # Simulation Mode: realistic biophysical agricultural telemetry
                 sim_step += 1
                 with self.lock:
                     base_temp = 25.0 + 3.0 * math.sin(sim_step * 0.05) + random.uniform(-0.3, 0.3)
                     base_humidity = 60.0 + 8.0 * math.cos(sim_step * 0.04) + random.uniform(-0.5, 0.5)
-                    # Light fluctuates across dark and bright threshold
-                    base_light = int(680 + 200 * math.sin(sim_step * 0.03) + random.uniform(-20, 20))
+                    base_light = int(680 + 220 * math.sin(sim_step * 0.03) + random.uniform(-15, 15))
                     base_light = max(50, min(1023, base_light))
 
                     led_on = base_light < self.latest_data["threshold"]
@@ -133,19 +169,14 @@ class SerialHandler:
                     self.latest_data["led_state"] = led_on
                     self.latest_data["last_updated"] = time.time()
                     self.latest_data["is_simulation"] = True
+                    self.latest_data["source"] = "simulation"
                     self.latest_data["port"] = "SIMULATED"
                     self.latest_data["status_message"] = "Simulating Real-Time Microcontroller Data"
 
-                    self._record_history()
+                    self._sync_and_record()
                 time.sleep(1.5)
 
     def _parse_line(self, line: str):
-        # Matches user's Arduino code prints:
-        # "Temperature: 24.50 C"
-        # "Humidity: 60.00 %"
-        # "Light Value: 720"
-        # "Dark - LED ON" / "Bright - LED OFF"
-        # "DHT11 reading failed!"
         with self.lock:
             updated = False
             temp_match = re.search(r"Temperature:\s*([0-9.]+)", line, re.IGNORECASE)
@@ -178,31 +209,42 @@ class SerialHandler:
             elif "LED OFF" in line.upper():
                 self.latest_data["led_state"] = False
                 updated = True
-            elif "light_value" in self.latest_data:
-                # Fallback to threshold rule if led line wasn't printed yet
-                self.latest_data["led_state"] = self.latest_data["light_value"] < self.latest_data["threshold"]
 
             if "DHT11 reading failed!" in line:
                 self.latest_data["status_message"] = "Warning: DHT11 Sensor Reading Failed (Check D2 wire)"
 
             if updated:
+                self.latest_data["source"] = "serial"
                 self.latest_data["last_updated"] = time.time()
-                self._record_history()
+                self._sync_and_record()
 
-    def _record_history(self):
+    def _sync_and_record(self):
+        # Calculate VPD and feed growth engine
+        growth_result = plant_engine.process_telemetry_tick(self.latest_data)
+        self.latest_data["vpd"] = growth_result.get("vpd", 1.0)
+        self.latest_data["turgor_wilt"] = growth_result.get("turgor_wilt", 0.0)
+
+        # In-memory history
         entry = {
             "time": time.strftime("%H:%M:%S"),
             "temperature": self.latest_data["temperature"],
             "humidity": self.latest_data["humidity"],
             "light_value": self.latest_data["light_value"],
-            "led_state": self.latest_data["led_state"]
+            "led_state": self.latest_data["led_state"],
+            "vpd": self.latest_data["vpd"]
         }
         self.history.append(entry)
         if len(self.history) > 60:
             self.history.pop(0)
 
+        # Broadcast to any registered listener
+        for cb in self.on_telemetry_callbacks:
+            try:
+                cb(dict(self.latest_data), growth_result)
+            except Exception as e:
+                print(f"Callback error: {e}")
+
     def set_manual_telemetry(self, temp=None, hum=None, light=None):
-        """Allows testing custom conditions (e.g. extreme heat, dry drought, dark night)"""
         with self.lock:
             if temp is not None:
                 self.latest_data["temperature"] = float(temp)
@@ -211,8 +253,9 @@ class SerialHandler:
             if light is not None:
                 self.latest_data["light_value"] = int(light)
                 self.latest_data["led_state"] = self.latest_data["light_value"] < self.latest_data["threshold"]
+            self.latest_data["source"] = "manual"
             self.latest_data["last_updated"] = time.time()
-            self._record_history()
+            self._sync_and_record()
 
     def get_telemetry(self):
         with self.lock:
@@ -221,3 +264,5 @@ class SerialHandler:
     def get_history(self):
         with self.lock:
             return list(self.history)
+
+serial_handler = SerialHandler()

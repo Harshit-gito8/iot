@@ -6,6 +6,7 @@ import os
 import json
 import threading
 import urllib.request
+from backend import database as db
 
 class VisionEngine:
     def __init__(self):
@@ -316,7 +317,7 @@ class VisionEngine:
 
         execution_time = round(time.time() - start_time, 2)
 
-        return {
+        result_payload = {
             "success": True,
             "has_plant": has_plant,
             "diagnosis_name": diagnosis_name,
@@ -345,6 +346,17 @@ class VisionEngine:
             "execution_time_sec": execution_time,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }
+
+        # Persist diagnosis in SQLite database for plant health timeline
+        if has_plant:
+            try:
+                plant = db.get_active_plant()
+                diag_id = db.record_diagnosis(plant["id"], result_payload)
+                result_payload["diagnosis_id"] = diag_id
+            except Exception as e:
+                print(f"Error persisting diagnosis to DB: {e}")
+
+        return result_payload
 
     def _track_plant_scan(self, has_plant: bool, coverage: float, width: float, height: float) -> dict:
         with self._plant_scan_lock:
@@ -398,9 +410,8 @@ class VisionEngine:
     def _query_gemini_vision(self, img_b64: str, diagnosis: str, damage: float, sensor_data: dict):
         """Optional query to Google Gemini Vision for deep agronomic consultation if API key is provided."""
         try:
-            # Strip data url prefix
-            clean_b64 = img_b64.split(",")[1] if "," in img_b64 else img_b64
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={self.gemini_api_key}"
+            # Secure header-based API key transfer (no key in URL query parameter)
+            url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
             sensor_str = ""
             if sensor_data:
@@ -425,10 +436,14 @@ class VisionEngine:
                 }]
             }
 
+            headers = {
+                'Content-Type': 'application/json',
+                'x-goog-api-key': self.gemini_api_key
+            }
             req = urllib.request.Request(
                 url,
                 data=json.dumps(payload).encode('utf-8'),
-                headers={'Content-Type': 'application/json'}
+                headers=headers
             )
             with urllib.request.urlopen(req, timeout=6) as response:
                 res_data = json.loads(response.read().decode('utf-8'))

@@ -1,71 +1,114 @@
 /**
- * Main Smart Farming Dashboard Application Controller
+ * AgriTwin Pro v2.0 - Application Controller
+ * Handles WebSockets, 3D Digital Twin sync, Camera Scanner, Actuation, and Tabs
  */
 
 let digitalTwin = null;
 let telemetryCharts = null;
 let webcamStream = null;
 let autoScanInterval = null;
-let lastTelemetry = null;
-let isAudioAlertEnabled = false;
-let plantScanInProgress = false;
+let wsConnection = null;
+let audioContextInstance = null;
+let currentLedState = false;
+let activePlantData = null;
 
 document.addEventListener('DOMContentLoaded', () => {
     // 1. Initialize 3D Digital Twin
     try {
         digitalTwin = new PlantDigitalTwin('digitalTwinCanvas');
+        digitalTwin.onActuatorToggle = (actuator) => {
+            if (actuator === "led") toggleGrowLightActuator();
+        };
     } catch (e) {
-        console.error("Failed to initialize 3D Digital Twin:", e);
+        console.error("3D Digital Twin initialization error:", e);
     }
 
     // 2. Initialize Telemetry Charts
     try {
         telemetryCharts = new TelemetryCharts();
     } catch (e) {
-        console.error("Failed to initialize Charts:", e);
+        console.error("Charts initialization error:", e);
     }
 
-    // 3. Setup UI Event Listeners
+    // 3. Setup Navigation, Tabs, and Themes
+    setupTabs();
+    setupThemeToggle();
     setupEventListeners();
 
-    // 4. Load COM Ports & Sample Library
+    // 4. Discover COM Ports & Sample Leaves
     refreshPortsList();
     loadSampleImages();
+    loadGrowthEvents();
 
-    // 5. Start Telemetry Polling Loop
-    startTelemetryLoop();
+    // 5. Establish Real-Time WebSocket Connection (with fallback)
+    initWebSocketTelemetry();
 });
 
+// --- Tab Controller ---
+function setupTabs() {
+    const tabBtns = document.querySelectorAll('.tab-btn');
+    const tabContents = document.querySelectorAll('.tab-content');
+
+    tabBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+            const targetId = btn.getAttribute('data-tab');
+
+            tabBtns.forEach(b => b.classList.remove('active'));
+            tabContents.forEach(c => c.classList.remove('active'));
+
+            btn.classList.add('active');
+            const targetContent = document.getElementById(targetId);
+            if (targetContent) targetContent.classList.add('active');
+
+            // Resize Three.js & Charts when tab becomes visible
+            if (targetId === 'tabTwin' && digitalTwin) digitalTwin.onResize();
+            if (targetId === 'tabTelemetry' && telemetryCharts) {
+                if (telemetryCharts.tempHumChart) telemetryCharts.tempHumChart.resize();
+                if (telemetryCharts.lightVpdChart) telemetryCharts.lightVpdChart.resize();
+            }
+            if (targetId === 'tabTimeline') loadGrowthEvents();
+        });
+    });
+}
+
+// --- Theme Switcher ---
+function setupThemeToggle() {
+    const btn = document.getElementById('btnThemeToggle');
+    if (!btn) return;
+
+    const savedTheme = localStorage.getItem('agritwin_theme') || 'dark';
+    document.documentElement.setAttribute('data-theme', savedTheme);
+    btn.textContent = savedTheme === 'light' ? '🌙' : '☀️';
+
+    btn.addEventListener('click', () => {
+        const current = document.documentElement.getAttribute('data-theme');
+        const next = current === 'light' ? 'dark' : 'light';
+        document.documentElement.setAttribute('data-theme', next);
+        localStorage.setItem('agritwin_theme', next);
+        btn.textContent = next === 'light' ? '🌙' : '☀️';
+    });
+}
+
+// --- Event Listeners ---
 function setupEventListeners() {
-    // Port Connection
+    // Port Controls
     document.getElementById('btnConnect')?.addEventListener('click', handleConnectPort);
     document.getElementById('btnDisconnect')?.addEventListener('click', handleDisconnectPort);
     document.getElementById('btnSimulate')?.addEventListener('click', handleSimulateMode);
-    document.getElementById('btnRefreshPorts')?.addEventListener('click', refreshPortsList);
-    document.getElementById('btnResetPlantScan')?.addEventListener('click', resetPlantScanBaseline);
 
-    // Camera Controls
+    // Actuators & Actions
+    document.getElementById('btnToggleLampActuator')?.addEventListener('click', toggleGrowLightActuator);
+    document.getElementById('btnActionWater')?.addEventListener('click', () => executeFarmerAction('watering'));
+    document.getElementById('btnActionPrune')?.addEventListener('click', () => executeFarmerAction('pruning'));
+    document.getElementById('btnActionFeed')?.addEventListener('click', () => executeFarmerAction('fertilizing'));
+
+    // Camera
     document.getElementById('btnStartCam')?.addEventListener('click', startWebcam);
     document.getElementById('btnStopCam')?.addEventListener('click', stopWebcam);
     document.getElementById('btnCaptureScan')?.addEventListener('click', captureAndDiagnose);
     document.getElementById('toggleAutoScan')?.addEventListener('change', handleAutoScanToggle);
 
-    // Image Upload
-    const fileInput = document.getElementById('imageFileInput');
-    if (fileInput) {
-        fileInput.addEventListener('change', (e) => {
-            const file = e.target.files[0];
-            if (file) {
-                const reader = new FileReader();
-                reader.onload = (event) => {
-                    runDiagnosisOnImage(event.target.result);
-                };
-                reader.readAsDataURL(file);
-            }
-        });
-    }
-
-    // 3D View Toggles
+    // Wireframe
     document.getElementById('btnToggleWireframe')?.addEventListener('click', () => {
         if (digitalTwin) {
             const isWf = digitalTwin.toggleWireframe();
@@ -73,7 +116,17 @@ function setupEventListeners() {
         }
     });
 
-    // Manual Sandbox Override Sliders
+    // File Upload
+    document.getElementById('imageFileInput')?.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            const reader = new FileReader();
+            reader.onload = (event) => runDiagnosisOnImage(event.target.result);
+            reader.readAsDataURL(file);
+        }
+    });
+
+    // Range Sliders
     const sliderTemp = document.getElementById('sliderTemp');
     const sliderHum = document.getElementById('sliderHum');
     const sliderLight = document.getElementById('sliderLight');
@@ -99,22 +152,241 @@ function setupEventListeners() {
     sliderHum?.addEventListener('input', updateSandbox);
     sliderLight?.addEventListener('input', updateSandbox);
 
-    // Print / Export Report
-    document.getElementById('btnPrintReport')?.addEventListener('click', () => {
-        window.print();
+    // Timeframe selector
+    document.querySelectorAll('.btn-timeframe').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.btn-timeframe').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            const hours = btn.getAttribute('data-hours');
+            fetchTelemetryHistory(hours);
+        });
     });
 
-    // Audio Alert Toggle
-    const chkAudio = document.getElementById('chkAudioAlert');
-    if (chkAudio) {
-        chkAudio.addEventListener('change', (e) => {
-            isAudioAlertEnabled = e.target.checked;
-        });
+    // Notifications panel
+    const bellBtn = document.getElementById('btnNotifBell');
+    const dropdown = document.getElementById('notifDropdown');
+    bellBtn?.addEventListener('click', () => {
+        dropdown?.classList.toggle('show');
+    });
+
+    document.getElementById('btnMarkAlertsRead')?.addEventListener('click', async () => {
+        await fetch('/api/alerts/mark-read', { method: 'POST' });
+        const badge = document.getElementById('notifCount');
+        if (badge) badge.style.display = 'none';
+        dropdown?.classList.remove('show');
+    });
+
+    // Print Report
+    document.getElementById('btnPrintReport')?.addEventListener('click', () => window.print());
+}
+
+// --- WebSocket Real-Time Streaming ---
+function initWebSocketTelemetry() {
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${location.host}/ws/telemetry`;
+
+    try {
+        wsConnection = new WebSocket(wsUrl);
+
+        wsConnection.onopen = () => {
+            console.log("WebSocket stream connected to AgriTwin Pro backend.");
+        };
+
+        wsConnection.onmessage = (event) => {
+            try {
+                const msg = JSON.parse(event.data);
+                if (msg.type === 'telemetry' || msg.type === 'init') {
+                    handleLiveTelemetryPacket(msg);
+                }
+            } catch (err) {
+                console.error("WebSocket message parsing error:", err);
+            }
+        };
+
+        wsConnection.onclose = () => {
+            console.warn("WebSocket closed. Falling back to HTTP polling.");
+            startHttpPollingFallback();
+        };
+
+        wsConnection.onerror = () => {
+            console.warn("WebSocket error. Falling back to HTTP polling.");
+            startHttpPollingFallback();
+        };
+    } catch (e) {
+        startHttpPollingFallback();
     }
 }
 
-// --- COM Port Management ---
+let pollingFallbackTimer = null;
+function startHttpPollingFallback() {
+    if (pollingFallbackTimer) return;
+    pollingFallbackTimer = setInterval(async () => {
+        try {
+            const [telRes, plantRes] = await Promise.all([
+                fetch('/api/telemetry'),
+                fetch('/api/plant')
+            ]);
+            if (telRes.ok) {
+                const telemetry = await telRes.json();
+                handleLiveTelemetryPacket({ type: 'telemetry', telemetry: telemetry });
+            }
+        } catch (e) {}
+    }, 1500);
+}
 
+function handleLiveTelemetryPacket(packet) {
+    const t = packet.telemetry;
+    if (!t) return;
+
+    currentLedState = t.led_state;
+
+    // Update Quick Telemetry Cards
+    document.getElementById('quickTemp').textContent = t.temperature.toFixed(1);
+    document.getElementById('quickHum').textContent = t.humidity.toFixed(1);
+    document.getElementById('quickVpd').textContent = (t.vpd || 1.05).toFixed(2);
+
+    // Update LED Badge
+    const ledBadge = document.getElementById('quickLed');
+    if (ledBadge) {
+        if (t.led_state) {
+            ledBadge.innerHTML = `<span class="led-indicator led-on"></span> ACTIVE (ON)`;
+            ledBadge.className = 'led-card-state state-on';
+        } else {
+            ledBadge.innerHTML = `<span class="led-indicator led-off"></span> STANDBY (OFF)`;
+            ledBadge.className = 'led-card-state state-off';
+        }
+    }
+
+    // Update HUD status chips
+    const vpdVal = t.vpd || 1.05;
+    let vpdLabel = "Optimal (0.8 - 1.2 kPa)";
+    if (vpdVal > 1.4) vpdLabel = `${vpdVal.toFixed(2)} kPa (High Transpiration Stress)`;
+    else if (vpdVal < 0.5) vpdLabel = `${vpdVal.toFixed(2)} kPa (Low Transpiration / Fungal Risk)`;
+    else vpdLabel = `${vpdVal.toFixed(2)} kPa (Optimal)`;
+    document.getElementById('hudVpd').textContent = vpdLabel;
+
+    // Update 3D Digital Twin
+    if (digitalTwin) {
+        digitalTwin.updateState(t, packet.growth);
+    }
+
+    // Append to rolling Chart history
+    if (telemetryCharts) {
+        fetchTelemetryHistory();
+    }
+}
+
+async function fetchTelemetryHistory(hours = null) {
+    try {
+        const url = hours ? `/api/history?hours=${hours}` : `/api/history?limit=30`;
+        const res = await fetch(url);
+        if (res.ok) {
+            const history = await res.json();
+            if (telemetryCharts) telemetryCharts.updateData(history);
+        }
+    } catch (e) {}
+}
+
+// --- Virtual-to-Physical Actuator Controls ---
+async function toggleGrowLightActuator() {
+    const nextState = !currentLedState;
+    try {
+        const res = await fetch('/api/actuators/led', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ state: nextState })
+        });
+        if (res.ok) {
+            currentLedState = nextState;
+            showToast(`Grow Luminaire turned ${nextState ? 'ON' : 'OFF'}`, 'success');
+        }
+    } catch (e) {
+        showToast(`Actuator command error: ${e.message}`, 'error');
+    }
+}
+
+async function executeFarmerAction(actionType) {
+    try {
+        const res = await fetch('/api/plant/action', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action_type: actionType, notes: "Triggered from digital twin interface" })
+        });
+        const data = await res.json();
+        if (data.success) {
+            showToast(data.message, 'success');
+            loadGrowthEvents();
+            // Re-sync plant twin
+            const twinRes = await fetch('/api/plant/twin');
+            if (twinRes.ok) {
+                const twinState = await twinRes.json();
+                if (digitalTwin) digitalTwin.rebuildPlantModel(twinState);
+            }
+        }
+    } catch (e) {
+        showToast(`Action failed: ${e.message}`, 'error');
+    }
+}
+
+// --- Plant Lifecycle & Events Table ---
+async function loadGrowthEvents() {
+    try {
+        const [plantRes, eventsRes] = await Promise.all([
+            fetch('/api/plant'),
+            fetch('/api/growth/events')
+        ]);
+
+        if (plantRes.ok) {
+            const pData = await plantRes.json();
+            const plant = pData.plant;
+            activePlantData = plant;
+
+            document.getElementById('timelineStageName').textContent = plant.growth_stage.replace('_', ' ').toUpperCase();
+            document.getElementById('timelineGdd').textContent = plant.total_gdd.toFixed(1);
+            document.getElementById('timelineHeight').textContent = `${plant.stem_height_cm.toFixed(1)} cm`;
+            document.getElementById('timelineLeaves').textContent = `${plant.leaf_count} Leaves`;
+            document.getElementById('timelineLightHrs').textContent = `${plant.total_light_hrs.toFixed(1)} hrs`;
+            document.getElementById('hudStage').textContent = plant.growth_stage.replace('_', ' ').toUpperCase();
+            document.getElementById('hudLeafCount').textContent = `${plant.leaf_count} Leaves`;
+
+            // Stage progress calculation
+            let pct = 20;
+            if (plant.growth_stage === 'early_vegetative') pct = 35;
+            else if (plant.growth_stage === 'vegetative') pct = 55;
+            else if (plant.growth_stage === 'flowering') pct = 75;
+            else if (plant.growth_stage === 'fruiting') pct = 90;
+            else if (plant.growth_stage === 'mature') pct = 100;
+            document.getElementById('timelineProgressBar').style.width = `${pct}%`;
+        }
+
+        if (eventsRes.ok) {
+            const events = await eventsRes.json();
+            const tbody = document.getElementById('growthEventsTableBody');
+            if (tbody) {
+                tbody.innerHTML = '';
+                if (events.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="3" style="text-align:center; color:var(--text-muted);">No events recorded yet</td></tr>';
+                } else {
+                    events.forEach(ev => {
+                        const tr = document.createElement('tr');
+                        const tdTime = document.createElement('td');
+                        tdTime.textContent = ev.timestamp;
+                        const tdType = document.createElement('td');
+                        tdType.innerHTML = `<span class="badge-success" style="padding:2px 8px; border-radius:10px; font-size:10px;">${ev.event_type.toUpperCase()}</span>`;
+                        const tdDesc = document.createElement('td');
+                        tdDesc.textContent = ev.description;
+                        tr.appendChild(tdTime);
+                        tr.appendChild(tdType);
+                        tr.appendChild(tdDesc);
+                        tbody.appendChild(tr);
+                    });
+                }
+            }
+        }
+    } catch (e) {}
+}
+
+// --- COM Port Management ---
 async function refreshPortsList() {
     try {
         const res = await fetch('/api/ports');
@@ -127,30 +399,36 @@ async function refreshPortsList() {
             data.ports.forEach(p => {
                 const opt = document.createElement('option');
                 opt.value = p.device;
-                opt.textContent = `${p.device} (${p.description || 'Serial Device'})`;
+                opt.textContent = `${p.device} (${p.description || 'Serial'})`;
                 select.appendChild(opt);
             });
         } else {
             const opt = document.createElement('option');
             opt.value = '';
-            opt.textContent = 'No physical COM ports found (Use Simulation)';
+            opt.textContent = 'Simulation Mode';
             select.appendChild(opt);
         }
 
-        updateConnectionBadge(data);
-    } catch (e) {
-        console.warn("Could not fetch ports:", e);
-    }
+        const badge = document.getElementById('connectionStatusBadge');
+        if (badge) {
+            if (data.is_connected && !data.is_simulation) {
+                badge.innerHTML = `<span class="badge-dot dot-online"></span> Connected: <strong>${data.current_port}</strong>`;
+                badge.className = "status-badge badge-success";
+            } else {
+                badge.innerHTML = `<span class="badge-dot dot-sim"></span> Source: <strong>Simulation</strong>`;
+                badge.className = "status-badge badge-sim";
+            }
+        }
+    } catch (e) {}
 }
 
 async function handleConnectPort() {
     const portSelect = document.getElementById('portSelect');
     const port = portSelect ? portSelect.value : '';
     if (!port) {
-        alert("Please select a valid COM port or click 'Simulation Mode'.");
+        showToast("Please choose a valid serial port", "warn");
         return;
     }
-
     try {
         const res = await fetch('/api/connect', {
             method: 'POST',
@@ -159,161 +437,32 @@ async function handleConnectPort() {
         });
         const result = await res.json();
         if (res.ok) {
-            showToast(`Connected to ${port}! Live sensor stream active.`, 'success');
+            showToast(`Connected to ${port} (115200 Baud)`, 'success');
+            refreshPortsList();
         } else {
-            showToast(`Failed: ${result.detail}`, 'error');
+            showToast(`Connection failed: ${result.detail}`, 'error');
         }
-        refreshPortsList();
     } catch (e) {
         showToast(`Connection error: ${e.message}`, 'error');
     }
 }
 
 async function handleDisconnectPort() {
-    try {
-        await fetch('/api/disconnect', { method: 'POST' });
-        showToast("Disconnected. Switched to Simulation Mode.", 'info');
-        refreshPortsList();
-    } catch (e) {
-        console.error(e);
-    }
+    await fetch('/api/disconnect', { method: 'POST' });
+    showToast("Switched to Simulation Mode", 'info');
+    refreshPortsList();
 }
 
 async function handleSimulateMode() {
-    try {
-        await fetch('/api/simulate', { method: 'POST' });
-        showToast("Simulation Mode Activated.", 'info');
-        refreshPortsList();
-    } catch (e) {
-        console.error(e);
-    }
+    await fetch('/api/simulate', { method: 'POST' });
+    showToast("Simulation Active", 'info');
+    refreshPortsList();
 }
 
-function updateConnectionBadge(data) {
-    const badge = document.getElementById('connectionStatusBadge');
-    if (!badge) return;
-
-    if (data.is_connected && !data.is_simulation) {
-        badge.innerHTML = `<span class="badge-dot dot-online"></span> Connected: <strong>${data.current_port}</strong> (115200 Baud)`;
-        badge.className = "status-badge badge-success";
-    } else {
-        badge.innerHTML = `<span class="badge-dot dot-sim"></span> Source: <strong>Simulation Mode</strong>`;
-        badge.className = "status-badge badge-sim";
-    }
-}
-
-// --- Real-Time Telemetry Stream Loop ---
-
-function startTelemetryLoop() {
-    setInterval(async () => {
-        try {
-            const [telemetryRes, historyRes] = await Promise.all([
-                fetch('/api/telemetry'),
-                fetch('/api/history')
-            ]);
-
-            if (telemetryRes.ok) {
-                const telemetry = await telemetryRes.json();
-                lastTelemetry = telemetry;
-                renderTelemetryUI(telemetry);
-
-                if (digitalTwin) {
-                    digitalTwin.updateTelemetry(telemetry);
-                }
-            }
-
-            if (historyRes.ok) {
-                const history = await historyRes.json();
-                if (telemetryCharts) {
-                    telemetryCharts.updateData(history);
-                }
-            }
-        } catch (e) {
-            console.warn("Telemetry polling tick error:", e);
-        }
-    }, 1500);
-}
-
-function renderTelemetryUI(t) {
-    // 1. Temperature Card
-    const tempEl = document.getElementById('metricTemp');
-    if (tempEl) tempEl.textContent = t.temperature.toFixed(1);
-
-    const tempStatus = document.getElementById('tempStatus');
-    if (tempStatus) {
-        if (t.temperature < 18) {
-            tempStatus.textContent = 'Cool / Slow Growth';
-            tempStatus.className = 'metric-status status-warn';
-        } else if (t.temperature > 30) {
-            tempStatus.textContent = 'Heat Stress Alert!';
-            tempStatus.className = 'metric-status status-danger';
-            playAlertSound();
-        } else {
-            tempStatus.textContent = 'Optimal Range (20-28°C)';
-            tempStatus.className = 'metric-status status-good';
-        }
-    }
-
-    // 2. Humidity Card
-    const humEl = document.getElementById('metricHum');
-    if (humEl) humEl.textContent = t.humidity.toFixed(1);
-
-    const humStatus = document.getElementById('humStatus');
-    if (humStatus) {
-        if (t.humidity < 40) {
-            humStatus.textContent = 'Low Moisture / Dry Air';
-            humStatus.className = 'metric-status status-warn';
-        } else if (t.humidity > 80) {
-            humStatus.textContent = 'High Humidity / Fungal Risk!';
-            humStatus.className = 'metric-status status-danger';
-        } else {
-            humStatus.textContent = 'Optimal Range (55-75%)';
-            humStatus.className = 'metric-status status-good';
-        }
-    }
-
-    // 3. Light Sensor Card (LDR)
-    const lightEl = document.getElementById('metricLight');
-    if (lightEl) lightEl.textContent = t.light_value;
-
-    const lightStatus = document.getElementById('lightStatus');
-    if (lightStatus) {
-        if (t.light_value < (t.threshold || 700)) {
-            lightStatus.textContent = `Dim / Night (< ${t.threshold})`;
-            lightStatus.className = 'metric-status status-warn';
-        } else {
-            lightStatus.textContent = `Bright / Sunlit (>= ${t.threshold})`;
-            lightStatus.className = 'metric-status status-good';
-        }
-    }
-
-    // 4. LED Grow Light State Card
-    const ledBadge = document.getElementById('metricLed');
-    if (ledBadge) {
-        if (t.led_state) {
-            ledBadge.innerHTML = `<span class="led-indicator led-on"></span> ACTIVE (ON)`;
-            ledBadge.className = 'led-card-state state-on';
-        } else {
-            ledBadge.innerHTML = `<span class="led-indicator led-off"></span> STANDBY (OFF)`;
-            ledBadge.className = 'led-card-state state-off';
-        }
-    }
-
-    // Microcontroller status message line
-    const msgEl = document.getElementById('systemStatusText');
-    if (msgEl && t.status_message) {
-        msgEl.textContent = t.status_message;
-    }
-}
-
-// --- Webcam & Vision Scanner ---
-
+// --- Webcam Scanner & Diagnosis ---
 async function startWebcam() {
     const video = document.getElementById('webcamVideo');
     const placeholder = document.getElementById('cameraPlaceholder');
-    const btnStart = document.getElementById('btnStartCam');
-    const btnStop = document.getElementById('btnStopCam');
-
     try {
         webcamStream = await navigator.mediaDevices.getUserMedia({
             video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "environment" }
@@ -323,12 +472,11 @@ async function startWebcam() {
             video.style.display = 'block';
             if (placeholder) placeholder.style.display = 'none';
         }
-        if (btnStart) btnStart.style.display = 'none';
-        if (btnStop) btnStop.style.display = 'inline-flex';
-        showToast("Laptop camera started. Point towards plant foliage.", "success");
+        document.getElementById('btnStartCam').style.display = 'none';
+        document.getElementById('btnStopCam').style.display = 'inline-flex';
+        showToast("Webcam active. Point at plant foliage.", "success");
     } catch (err) {
-        console.error("Camera access error:", err);
-        showToast("Could not access camera: " + err.message + ". You can use Image Upload or Sample Leaves.", "error");
+        showToast(`Camera error: ${err.message}`, "error");
     }
 }
 
@@ -339,23 +487,19 @@ function stopWebcam() {
     }
     const video = document.getElementById('webcamVideo');
     const placeholder = document.getElementById('cameraPlaceholder');
-    const btnStart = document.getElementById('btnStartCam');
-    const btnStop = document.getElementById('btnStopCam');
-
     if (video) video.style.display = 'none';
     if (placeholder) placeholder.style.display = 'flex';
-    if (btnStart) btnStart.style.display = 'inline-flex';
-    if (btnStop) btnStop.style.display = 'none';
+    document.getElementById('btnStartCam').style.display = 'inline-flex';
+    document.getElementById('btnStopCam').style.display = 'none';
 }
 
 function captureAndDiagnose() {
     const video = document.getElementById('webcamVideo');
     if (!webcamStream || !video || video.style.display === 'none') {
-        showToast("Please click 'Start Camera' first or choose an image / sample leaf.", "warn");
+        showToast("Please start camera or select a sample image first", "warn");
         return;
     }
 
-    // Capture current frame onto an off-screen canvas
     const canvas = document.createElement('canvas');
     canvas.width = video.videoWidth || 640;
     canvas.height = video.videoHeight || 480;
@@ -369,9 +513,7 @@ function captureAndDiagnose() {
 function handleAutoScanToggle(e) {
     if (e.target.checked) {
         if (!webcamStream) {
-            startWebcam().then(() => {
-                startAutoScanInterval();
-            });
+            startWebcam().then(() => startAutoScanInterval());
         } else {
             startAutoScanInterval();
         }
@@ -380,20 +522,16 @@ function handleAutoScanToggle(e) {
             clearInterval(autoScanInterval);
             autoScanInterval = null;
         }
-        showToast("Auto-scan stopped.", "info");
+        showToast("Auto-scan stopped", "info");
     }
 }
 
 function startAutoScanInterval() {
     if (autoScanInterval) clearInterval(autoScanInterval);
-    showToast("Auto-Scan Active: Capturing plant inspection every 25 seconds.", "info");
+    showToast("Auto-Scan Active (Every 25s)", "info");
     captureAndDiagnose();
-    autoScanInterval = setInterval(() => {
-        captureAndDiagnose();
-    }, 25000);
+    autoScanInterval = setInterval(() => captureAndDiagnose(), 25000);
 }
-
-// --- Sample Leaves Library ---
 
 async function loadSampleImages() {
     try {
@@ -407,22 +545,13 @@ async function loadSampleImages() {
             const btn = document.createElement('button');
             btn.className = 'sample-chip';
             btn.innerHTML = `<img src="${sample.image}" alt="${sample.name}" /> <span>${sample.name}</span>`;
-            btn.addEventListener('click', () => {
-                runDiagnosisOnImage(sample.image);
-            });
+            btn.addEventListener('click', () => runDiagnosisOnImage(sample.image));
             container.appendChild(btn);
         });
-    } catch (e) {
-        console.warn("Could not load sample images:", e);
-    }
+    } catch (e) {}
 }
 
-// --- Diagnosis Execution & Farmer Report Rendering ---
-
 async function runDiagnosisOnImage(base64Image, trackPlant = false) {
-    if (trackPlant && plantScanInProgress) return;
-    if (trackPlant) plantScanInProgress = true;
-
     const scanLoader = document.getElementById('scanLoader');
     if (scanLoader) scanLoader.style.display = 'flex';
 
@@ -438,163 +567,87 @@ async function runDiagnosisOnImage(base64Image, trackPlant = false) {
         });
 
         const diagnosis = await res.json();
-
         if (res.ok && diagnosis.success) {
             renderDiagnosticReport(diagnosis);
-            if (digitalTwin && diagnosis.has_plant) {
-                digitalTwin.updateDiseaseState(diagnosis);
+
+            // Re-fetch 3D twin with newly mapped leaf pathology
+            const twinRes = await fetch('/api/plant/twin');
+            if (twinRes.ok) {
+                const twinState = await twinRes.json();
+                if (digitalTwin) digitalTwin.rebuildPlantModel(twinState);
             }
-            if (digitalTwin && diagnosis.plant_scan) {
-                digitalTwin.updatePlantScan(diagnosis.plant_scan);
-            }
-            renderPlantScan(diagnosis.plant_scan);
-            showToast(`Diagnosis Complete: ${diagnosis.diagnosis_name}`, 'success');
+
+            showToast(`Diagnosis: ${diagnosis.diagnosis_name}`, 'success');
         } else {
             showToast(`Diagnosis failed: ${diagnosis.detail || 'Error'}`, 'error');
         }
     } catch (e) {
-        showToast(`Diagnosis request error: ${e.message}`, 'error');
+        showToast(`Request error: ${e.message}`, 'error');
     } finally {
         if (scanLoader) scanLoader.style.display = 'none';
-        if (trackPlant) plantScanInProgress = false;
-    }
-}
-
-function renderPlantScan(scan) {
-    const status = document.getElementById('hudPlantScan');
-    if (!status || !scan) return;
-
-    if (scan.status === 'no_plant') {
-        status.textContent = 'Plant not detected · twin unchanged';
-    } else if (scan.status === 'baseline') {
-        status.textContent = `Baseline saved · canopy ${scan.width_pct.toFixed(1)}% × ${scan.height_pct.toFixed(1)}% of frame`;
-    } else {
-        const change = scan.coverage_change_pct;
-        const direction = change > 1 ? 'larger' : (change < -1 ? 'smaller' : 'stable');
-        status.textContent = `Scan ${scan.scan_number} · foliage ${change > 0 ? '+' : ''}${change.toFixed(1)}% (${direction})`;
-    }
-}
-
-async function resetPlantScanBaseline() {
-    try {
-        const response = await fetch('/api/plant-scan/reset', { method: 'POST' });
-        if (!response.ok) throw new Error(`Request failed (${response.status})`);
-        if (digitalTwin) digitalTwin.resetPlantScan();
-        const status = document.getElementById('hudPlantScan');
-        if (status) status.textContent = 'Baseline cleared · capture a new reference scan';
-        showToast('Plant reference scan cleared. Capture the plant to set a new baseline.', 'info');
-    } catch (error) {
-        showToast(`Could not reset plant baseline: ${error.message}`, 'error');
     }
 }
 
 function renderDiagnosticReport(d) {
-    // 1. Images (Original & Annotated Heatmap)
-    const imgOrig = document.getElementById('diagImgOriginal');
-    const imgAnnotated = document.getElementById('diagImgAnnotated');
-    if (imgOrig) imgOrig.src = d.original_image;
-    if (imgAnnotated) imgAnnotated.src = d.annotated_image;
+    document.getElementById('diagImgOriginal').src = d.original_image;
+    document.getElementById('diagImgAnnotated').src = d.annotated_image;
 
-    // 2. Main Badge & Disease Name
-    const nameEl = document.getElementById('diagName');
-    if (nameEl) nameEl.textContent = d.diagnosis_name;
-
-    const pathogenEl = document.getElementById('diagPathogen');
-    if (pathogenEl) pathogenEl.textContent = d.pathogen_type;
+    document.getElementById('diagName').textContent = d.diagnosis_name;
+    document.getElementById('diagPathogen').textContent = d.pathogen_type;
 
     const severityEl = document.getElementById('diagSeverity');
-    if (severityEl) {
-        severityEl.textContent = d.severity;
-        severityEl.className = `severity-badge severity-${d.severity.toLowerCase()}`;
-    }
+    severityEl.textContent = d.severity;
+    severityEl.className = `severity-badge severity-${d.severity.toLowerCase()}`;
 
-    const healthGauge = document.getElementById('diagHealthScore');
-    if (healthGauge) {
-        healthGauge.textContent = `${d.health_score}/100`;
-        healthGauge.style.color = d.health_score > 80 ? '#2ecc71' : (d.health_score > 50 ? '#f39c12' : '#e74c3c');
-    }
+    const scoreEl = document.getElementById('diagHealthScore');
+    scoreEl.textContent = `${d.health_score}/100`;
+    scoreEl.style.color = d.health_score > 80 ? '#10b981' : (d.health_score > 50 ? '#f59e0b' : '#ef4444');
 
-    // 3. Quantitative Damage Metrics
-    const damageEl = document.getElementById('metricDamagePct');
-    if (damageEl) damageEl.textContent = `${d.damage_percentage}%`;
+    document.getElementById('metricDamagePct').textContent = `${d.damage_percentage}%`;
+    document.getElementById('metricNecroticPct').textContent = `${d.metrics?.necrotic_percentage || 0}%`;
+    document.getElementById('metricChlorosisPct').textContent = `${d.metrics?.chlorosis_percentage || 0}%`;
+    document.getElementById('metricMildewPct').textContent = `${d.metrics?.mildew_percentage || 0}%`;
 
-    const necroticEl = document.getElementById('metricNecroticPct');
-    if (necroticEl && d.metrics) necroticEl.textContent = `${d.metrics.necrotic_percentage}%`;
+    document.getElementById('diagSymptoms').textContent = d.primary_symptoms;
 
-    const chlorosisEl = document.getElementById('metricChlorosisPct');
-    if (chlorosisEl && d.metrics) chlorosisEl.textContent = `${d.metrics.chlorosis_percentage}%`;
-
-    const mildewEl = document.getElementById('metricMildewPct');
-    if (mildewEl && d.metrics) mildewEl.textContent = `${d.metrics.mildew_percentage}%`;
-
-    // 4. Symptoms Breakdown
-    const symptomsEl = document.getElementById('diagSymptoms');
-    if (symptomsEl) symptomsEl.textContent = d.primary_symptoms;
-
-    // 5. Environmental IoT Sensor Warnings
-    const warningsBox = document.getElementById('sensorWarningsBox');
-    const warningsList = document.getElementById('sensorWarningsList');
-    if (warningsBox && warningsList) {
-        if (d.sensor_correlations && d.sensor_correlations.length > 0) {
-            warningsBox.style.display = 'block';
-            warningsList.innerHTML = d.sensor_correlations.map(w => `<li>${w}</li>`).join('');
-        } else {
-            warningsBox.style.display = 'none';
-            warningsList.innerHTML = '';
-        }
-    }
-
-    // 6. Action & Treatment Plan for Farmer
     const act = d.farmer_action_plan || {};
-    const immEl = document.getElementById('planImmediate');
-    if (immEl) immEl.textContent = act.immediate_action || 'None';
+    document.getElementById('planImmediate').textContent = act.immediate_action || 'None';
+    document.getElementById('planOrganic').textContent = act.organic_treatment || 'None';
+    document.getElementById('planChemical').textContent = act.chemical_treatment || 'None';
 
-    const orgEl = document.getElementById('planOrganic');
-    if (orgEl) orgEl.textContent = act.organic_treatment || 'None';
-
-    const chemEl = document.getElementById('planChemical');
-    if (chemEl) chemEl.textContent = act.chemical_treatment || 'None';
-
-    // 7. Gemini Insights (if present)
     const geminiBox = document.getElementById('geminiBox');
     const geminiText = document.getElementById('geminiText');
-    if (geminiBox && geminiText) {
-        if (d.gemini_insights) {
-            geminiBox.style.display = 'block';
-            geminiText.textContent = d.gemini_insights;
-        } else {
-            geminiBox.style.display = 'none';
-        }
+    if (d.gemini_insights) {
+        geminiBox.style.display = 'block';
+        geminiText.textContent = d.gemini_insights;
+    } else {
+        geminiBox.style.display = 'none';
     }
 
-    // 8. Timestamp
-    const timeEl = document.getElementById('diagTimestamp');
-    if (timeEl) timeEl.textContent = `Report generated: ${d.timestamp}`;
-
-    // Play warning sound if critical
-    if (d.severity === "CRITICAL" || d.health_score < 40) {
-        playAlertSound();
-    }
+    if (d.severity === 'CRITICAL') playAlertTone();
 }
 
-// --- Audio & Toast Utilities ---
-
-function playAlertSound() {
-    if (!isAudioAlertEnabled) return;
+// --- Audio Tone & Notifications ---
+function playAlertTone() {
     try {
-        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const osc = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
+        if (!audioContextInstance) {
+            audioContextInstance = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (audioContextInstance.state === 'suspended') {
+            audioContextInstance.resume();
+        }
+        const osc = audioContextInstance.createOscillator();
+        const gain = audioContextInstance.createGain();
         osc.connect(gain);
-        gain.connect(audioCtx.destination);
+        gain.connect(audioContextInstance.destination);
         osc.type = 'sine';
-        osc.frequency.setValueAtTime(587.33, audioCtx.currentTime); // D5
-        osc.frequency.setValueAtTime(880.00, audioCtx.currentTime + 0.15); // A5
-        gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.4);
+        osc.frequency.setValueAtTime(587.33, audioContextInstance.currentTime);
+        osc.frequency.setValueAtTime(880.00, audioContextInstance.currentTime + 0.15);
+        gain.gain.setValueAtTime(0.12, audioContextInstance.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioContextInstance.currentTime + 0.35);
         osc.start();
-        osc.stop(audioCtx.currentTime + 0.4);
-    } catch (e) { }
+        osc.stop(audioContextInstance.currentTime + 0.35);
+    } catch (e) {}
 }
 
 function showToast(msg, type = 'info') {
@@ -605,6 +658,6 @@ function showToast(msg, type = 'info') {
     setTimeout(() => toast.classList.add('show'), 20);
     setTimeout(() => {
         toast.classList.remove('show');
-        setTimeout(() => toast.remove(), 400);
-    }, 3800);
+        setTimeout(() => toast.remove(), 350);
+    }, 3600);
 }

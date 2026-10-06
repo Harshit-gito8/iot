@@ -1,4 +1,8 @@
-import uvicorn
+try:
+    import uvicorn  # type: ignore[import-not-found]
+except ModuleNotFoundError:
+    uvicorn = None
+
 import webbrowser
 import threading
 import time
